@@ -167,43 +167,29 @@ func (r *Runtime) recordIncident(runID, severity, message string) model.Incident
 	return incident
 }
 
-func (r *Runtime) ValidateLaunchRequest(request LaunchRequest) error {
-	control := r.ensureControl()
-	station, ok := control.Stations[request.StationID]
-	if !ok {
-		return fmt.Errorf("unknown launch station %s", request.StationID)
-	}
-	if station.Role != model.StationLauncher || !station.Enabled {
-		return errors.New("station is not an enabled launcher")
-	}
-	routeState, ok := control.Routes[request.RouteID]
-	if !ok {
-		return fmt.Errorf("unknown route %s", request.RouteID)
-	}
-	if routeState.FromStation != station.ID {
-		return errors.New("route does not start at launcher")
-	}
-	if _, err := control.Network.Path(routeState.FromStation, routeState.ToStation, request.TargetPressure); err != nil {
-		return err
-	}
-	if request.TargetPressure <= 0 || request.TargetPressure > station.PressureLimit {
-		return fmt.Errorf("target pressure must be within 0 and %.2f", station.PressureLimit)
-	}
-	return nil
-}
+func (r *Runtime) Launch(ctx context.Context, request LaunchRequest) (LaunchResponse, error) {
+	// A freshly created run starts at epoch 1 and the closure command is issued
+	// at epoch+1; the preflight probe uses the same epoch as the real chain.
+	const freshClosureEpoch int64 = 2
 
-func (r *Runtime) Launch(ctx context.Context, request LaunchRequest) (model.OperationRecord, error) {
-	if err := r.ValidateLaunchRequest(request); err != nil {
-		return model.OperationRecord{}, err
+	// Re-adopt the shared gate evaluation as a read-only probe. If any item
+	// blocks, bail out before creating a run or fencing a route.
+	_, preflightChecks := r.evaluateLaunchChecks(request, probeRunID(request), freshClosureEpoch)
+	if blocked := blockingChecks(preflightChecks); len(blocked) > 0 {
+		return LaunchResponse{}, &ChecksBlockedError{Checks: preflightChecks}
 	}
+
 	created, err := r.CreateOperation(request.StationID)
 	if err != nil {
-		return model.OperationRecord{}, err
+		return LaunchResponse{}, err
 	}
 	lease, routeErr := r.Routes.Reserve(request.RouteID, created.ID, created.Epoch)
 	if routeErr != nil {
 		r.recordIncident(created.ID, "warning", routeErr.Error())
-		return model.OperationRecord{}, routeErr
+		// Re-evaluate against the real run so the report shows the item that
+		// actually lost the reservation race.
+		_, launchChecks := r.evaluateLaunchChecks(request, created.ID, freshClosureEpoch)
+		return LaunchResponse{}, &ChecksBlockedError{Checks: launchChecks}
 	}
 	closureEpoch := created.Epoch + 1
 	r.Launcher.BeginClosure(created.ID, closureEpoch)
@@ -217,20 +203,20 @@ func (r *Runtime) Launch(ctx context.Context, request LaunchRequest) (model.Oper
 	valveErr := r.Launcher.ConfirmClosure(closureProof)
 	if err := launcher.CombineLaunchResults(valveErr, routeErr); err != nil {
 		r.Routes.Release(request.RouteID, created.ID)
-		return model.OperationRecord{}, err
+		return LaunchResponse{}, err
 	}
 	if !r.Launcher.CanLaunch(closureProof) {
 		r.Routes.Release(request.RouteID, created.ID)
-		return model.OperationRecord{}, errors.New("launcher interlocks rejected current closure proof")
+		return LaunchResponse{}, errors.New("launcher interlocks rejected current closure proof")
 	}
 	if err := r.Pressure.Apply(created.ID, request.TargetPressure); err != nil {
 		r.Routes.Release(request.RouteID, created.ID)
-		return model.OperationRecord{}, err
+		return LaunchResponse{}, err
 	}
 	if err := run.Start(r.Runs, created.ID); err != nil {
 		r.Pressure.Stop()
 		r.Routes.Release(request.RouteID, created.ID)
-		return model.OperationRecord{}, err
+		return LaunchResponse{}, err
 	}
 	now := time.Now().UTC()
 	r.mu.Lock()
@@ -270,15 +256,29 @@ func (r *Runtime) Launch(ctx context.Context, request LaunchRequest) (model.Oper
 		Payload: request.RouteID,
 		At:      now,
 	}); err != nil {
-		return model.OperationRecord{}, err
+		return LaunchResponse{}, err
 	}
+
+	// Re-run the same per-item checks against the real run id and closure
+	// epoch, after the state changes, producing the launch-time version that
+	// corresponds item-for-item with the preflight report.
+	_, launchChecks := r.evaluateLaunchChecks(request, created.ID, closureEpoch)
+
 	select {
 	case <-ctx.Done():
 		_ = r.Cancel(created.ID)
-		return model.OperationRecord{}, ctx.Err()
+		return LaunchResponse{}, ctx.Err()
 	default:
 	}
-	return r.Operation(created.ID)
+	operation, err := r.Operation(created.ID)
+	if err != nil {
+		return LaunchResponse{}, err
+	}
+	return LaunchResponse{
+		Operation:       operation,
+		PreflightChecks: preflightChecks,
+		LaunchChecks:    launchChecks,
+	}, nil
 }
 
 func (r *Runtime) Track(runID string, request TrackingRequest) (model.OperationRecord, error) {

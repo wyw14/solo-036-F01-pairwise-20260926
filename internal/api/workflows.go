@@ -87,22 +87,64 @@ func parseObservedAt(value string) (time.Time, error) {
 	return parsed.UTC(), nil
 }
 
+type blockedChecksResponse struct {
+	Error     string                `json:"error"`
+	Ready     bool                  `json:"ready"`
+	Checks    []service.LaunchCheck `json:"checks"`
+	Blocking  []string              `json:"blocking"`
+	RequestID string                `json:"request_id,omitempty"`
+}
+
 func (h *Handler) Launch(w http.ResponseWriter, r *http.Request) {
 	var request createRequest
 	if err := decodeBody(w, r, &request); err != nil {
 		writeError(w, r, http.StatusBadRequest, err)
 		return
 	}
-	operation, err := h.runtime.Launch(r.Context(), service.LaunchRequest{
+	response, err := h.runtime.Launch(r.Context(), service.LaunchRequest{
 		StationID:      request.StationID,
 		RouteID:        request.RouteID,
 		TargetPressure: request.TargetPressure,
 	})
 	if err != nil {
+		var blocked *service.ChecksBlockedError
+		if errors.As(err, &blocked) {
+			names := make([]string, 0)
+			for _, check := range blocked.Checks {
+				if !check.Ready {
+					names = append(names, check.Name)
+				}
+			}
+			writeJSON(w, http.StatusConflict, blockedChecksResponse{
+				Error:     err.Error(),
+				Ready:     false,
+				Checks:    blocked.Checks,
+				Blocking:  names,
+				RequestID: strings.TrimSpace(r.Header.Get("x-request-id")),
+			})
+			return
+		}
 		writeError(w, r, http.StatusConflict, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, operation)
+	writeJSON(w, http.StatusCreated, response)
+}
+
+// Preflight runs the launch gate evaluation without creating an operation or
+// touching field state. It always returns 200 with the per-item report; the
+// report's ready flag says whether a launch would currently be admitted.
+func (h *Handler) Preflight(w http.ResponseWriter, r *http.Request) {
+	var request createRequest
+	if err := decodeBody(w, r, &request); err != nil {
+		writeError(w, r, http.StatusBadRequest, err)
+		return
+	}
+	report := h.runtime.PreflightLaunch(service.LaunchRequest{
+		StationID:      request.StationID,
+		RouteID:        request.RouteID,
+		TargetPressure: request.TargetPressure,
+	})
+	writeJSON(w, http.StatusOK, report)
 }
 
 func (h *Handler) Operation(w http.ResponseWriter, r *http.Request) {
