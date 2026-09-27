@@ -167,29 +167,14 @@ func (r *Runtime) recordIncident(runID, severity, message string) model.Incident
 	return incident
 }
 
+// ValidateLaunchRequest runs only the gates enforced before a run is created
+// (station, route identity, path reachability, pressure limit). It reuses the
+// same decisions as Preflight, so the launch's re-check matches the rehearsal
+// item for item. Occupancy and closure are enforced later inside Launch.
 func (r *Runtime) ValidateLaunchRequest(request LaunchRequest) error {
-	control := r.ensureControl()
-	station, ok := control.Stations[request.StationID]
-	if !ok {
-		return fmt.Errorf("unknown launch station %s", request.StationID)
-	}
-	if station.Role != model.StationLauncher || !station.Enabled {
-		return errors.New("station is not an enabled launcher")
-	}
-	routeState, ok := control.Routes[request.RouteID]
-	if !ok {
-		return fmt.Errorf("unknown route %s", request.RouteID)
-	}
-	if routeState.FromStation != station.ID {
-		return errors.New("route does not start at launcher")
-	}
-	if _, err := control.Network.Path(routeState.FromStation, routeState.ToStation, request.TargetPressure); err != nil {
-		return err
-	}
-	if request.TargetPressure <= 0 || request.TargetPressure > station.PressureLimit {
-		return fmt.Errorf("target pressure must be within 0 and %.2f", station.PressureLimit)
-	}
-	return nil
+	view := r.launchGateView()
+	gates, _ := evaluateValidationGates(view, request)
+	return firstBlockingError(gates)
 }
 
 func (r *Runtime) Launch(ctx context.Context, request LaunchRequest) (model.OperationRecord, error) {

@@ -105,6 +105,23 @@ func (h *Handler) Launch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, operation)
 }
 
+// Preflight rehearses a launch without changing field state. It always returns
+// 200 with an itemized report; blocking gates are signalled by ready=false so
+// the operator can see every conclusion at once rather than a single 409.
+func (h *Handler) Preflight(w http.ResponseWriter, r *http.Request) {
+	var request createRequest
+	if err := decodeBody(w, r, &request); err != nil {
+		writeError(w, r, http.StatusBadRequest, err)
+		return
+	}
+	report := h.runtime.Preflight(service.LaunchRequest{
+		StationID:      request.StationID,
+		RouteID:        request.RouteID,
+		TargetPressure: request.TargetPressure,
+	})
+	writeJSON(w, http.StatusOK, report)
+}
+
 func (h *Handler) Operation(w http.ResponseWriter, r *http.Request) {
 	runID := chi.URLParam(r, "runID")
 	operation, err := h.runtime.Operation(runID)

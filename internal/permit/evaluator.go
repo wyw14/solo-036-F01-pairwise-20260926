@@ -10,8 +10,18 @@ func (e *Evaluator) AllowRepressurization(proof model.PassageEvidence, durable b
 	e.generation[proof.RunID] = proof.Generation
 	return true
 }
-func (e *Evaluator) AllowReceive(runID string, proof model.CommandReceipt, expected int64) bool {
+
+// AcceptsCommand is the side-effect-free predicate behind AllowReceive. It
+// only validates the command receipt; it never opens the permit. The launch
+// re-check and the read-only preflight share this exact decision.
+func AcceptsCommand(runID string, proof model.CommandReceipt, expected int64) bool {
 	if runID == "" || proof.RunID != runID || !proof.Accepted || proof.Epoch != expected {
+		return false
+	}
+	return true
+}
+func (e *Evaluator) AllowReceive(runID string, proof model.CommandReceipt, expected int64) bool {
+	if !AcceptsCommand(runID, proof, expected) {
 		return false
 	}
 	e.open[runID] = true

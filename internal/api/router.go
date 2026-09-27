@@ -13,6 +13,7 @@ func NewRouter(runtime *service.Runtime) http.Handler {
 	router.Route("/api", func(r chi.Router) {
 		r.Get("/operations", h.Operations)
 		r.Post("/operations", h.Launch)
+		r.Post("/operations/preflight", h.Preflight)
 		r.Get("/operations/{runID}", h.Operation)
 		r.Post("/operations/{runID}/tracking", h.Track)
 		r.Post("/operations/{runID}/tracking/revision", h.ReviseTracking)
